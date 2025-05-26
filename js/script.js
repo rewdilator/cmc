@@ -71,27 +71,14 @@ const state = {
     sortConfig: {
         key: 'market_cap',
         direction: 'desc'
-    },
-    exchangeRates: {
-        USD: 1,
-        EUR: 0.93,
-        GBP: 0.80,
-        JPY: 151.50
-    },
-    currencySymbols: {
-        USD: '$',
-        EUR: '€',
-        GBP: '£',
-        JPY: '¥'
     }
 };
 
-// Exchange API endpoints
+// Exchange API endpoints - Keep these
 const API_ENDPOINTS = {
     BINANCE: 'https://api.binance.com/api/v3',
     OKX: 'https://www.okx.com/api/v5',
-    XT: 'https://api.xt.com',
-    COINGECKO: 'https://api.coingecko.com/api/v3'
+    XT: 'https://api.xt.com'
 };
 
 // Initialize the app
@@ -203,36 +190,70 @@ async function fetchAllData() {
 // Fetch cryptocurrency data from Binance, OKX, and XT
 async function fetchCryptoData() {
     try {
-        // Get top 100 coins by market cap from CoinGecko as a base
-        const geckoResponse = await fetch(`${API_ENDPOINTS.COINGECKO}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&sparkline=true&price_change_percentage=24h`);
-        const geckoData = await geckoResponse.json();
+        // First get all trading pairs from Binance to know what's available
+        const binanceResponse = await fetch(`${API_ENDPOINTS.BINANCE}/exchangeInfo`);
+        const binanceData = await binanceResponse.json();
         
-        // Enhance with data from exchanges
-        const enhancedData = await Promise.all(geckoData.map(async (coin) => {
-            // Get prices from exchanges
-            const [binancePrice, okxPrice, xtPrice] = await Promise.all([
-                getExchangePrice(coin.symbol.toUpperCase(), 'BINANCE'),
-                getExchangePrice(coin.symbol.toUpperCase(), 'OKX'),
-                getExchangePrice(coin.symbol.toUpperCase(), 'XT')
+        // Filter for USDT pairs and extract base currencies
+        const usdtPairs = binanceData.symbols
+            .filter(s => s.quoteAsset === 'USDT')
+            .map(s => s.baseAsset);
+        
+        // Get ticker data for all USDT pairs
+        const tickerResponse = await fetch(`${API_ENDPOINTS.BINANCE}/ticker/24hr`);
+        const tickerData = await tickerResponse.json();
+        
+        // Process the data into our format
+        const processedData = tickerData
+            .filter(t => t.symbol.endsWith('USDT'))
+            .map(t => {
+                const symbol = t.symbol.replace('USDT', '');
+                return {
+                    id: symbol.toLowerCase(),
+                    symbol: symbol,
+                    name: symbol,
+                    current_price: parseFloat(t.lastPrice),
+                    price_change_percentage_24h: parseFloat(t.priceChangePercent),
+                    total_volume: parseFloat(t.quoteVolume),
+                    market_cap: parseFloat(t.lastPrice) * parseFloat(t.volume), // Approximate
+                    sparkline: null, // We'll need to fetch this separately
+                    exchanges: {
+                        binance: parseFloat(t.lastPrice),
+                        okx: null, // Will fetch below
+                        xt: null  // Will fetch below
+                    }
+                };
+            });
+        
+        // Enhance with data from other exchanges
+        const enhancedData = await Promise.all(processedData.map(async (coin) => {
+            const [okxPrice, xtPrice] = await Promise.all([
+                getExchangePrice(coin.symbol, 'OKX'),
+                getExchangePrice(coin.symbol, 'XT')
             ]);
             
             // Calculate average price
-            const prices = [binancePrice, okxPrice, xtPrice].filter(p => p !== null);
+            const prices = [coin.exchanges.binance, okxPrice, xtPrice].filter(p => p !== null);
             const avgPrice = prices.length > 0 ? prices.reduce((sum, p) => sum + p, 0) / prices.length : coin.current_price;
             
             return {
                 ...coin,
-                id: coin.id,
-                symbol: coin.symbol.toUpperCase(),
                 current_price: avgPrice,
                 exchanges: {
-                    binance: binancePrice,
+                    binance: coin.exchanges.binance,
                     okx: okxPrice,
                     xt: xtPrice
-                },
-                price_change_percentage_24h: coin.price_change_percentage_24h || 0
+                }
             };
         }));
+        
+        // Sort by market cap descending
+        enhancedData.sort((a, b) => b.market_cap - a.market_cap);
+        
+        // Add ranks
+        enhancedData.forEach((coin, index) => {
+            coin.rank = index + 1;
+        });
         
         state.cryptoData = enhancedData;
         state.filteredCryptoData = [...enhancedData];
@@ -245,53 +266,175 @@ async function fetchCryptoData() {
     }
 }
 
-// Get price from a specific exchange
+// Get price from a specific exchange - Keep this function but improve error handling
 async function getExchangePrice(symbol, exchange) {
     try {
         let price = null;
         
         switch(exchange) {
             case 'BINANCE':
-                // Binance uses BTC, ETH, BNB, USDT, etc. as quote currencies
-                const binanceResponse = await fetch(`${API_ENDPOINTS.BINANCE}/ticker/price?symbol=${symbol}USDT`);
-                const binanceData = await binanceResponse.json();
-                price = parseFloat(binanceData.price);
-                break;
+                // Already handled in fetchCryptoData
+                return null;
                 
             case 'OKX':
-                // OKX uses similar format but with dash: BTC-USDT
                 const okxResponse = await fetch(`${API_ENDPOINTS.OKX}/market/ticker?instId=${symbol}-USDT`);
                 const okxData = await okxResponse.json();
-                if (okxData.data && okxData.data.length > 0) {
-                    price = parseFloat(okxData.data[0].last);
+                if (okxData.data && okxData.data.length > 0 && okxData.data[0].last) {
+                    return parseFloat(okxData.data[0].last);
                 }
                 break;
                 
             case 'XT':
-                // XT.com uses slash: BTC/USDT
                 const xtResponse = await fetch(`${API_ENDPOINTS.XT}/trade/api/v1/getTicker?symbol=${symbol.toLowerCase()}_usdt`);
                 const xtData = await xtResponse.json();
-                if (xtData.result && xtData.ticker) {
-                    price = parseFloat(xtData.ticker.last);
+                if (xtData.result && xtData.ticker && xtData.ticker.last) {
+                    return parseFloat(xtData.ticker.last);
                 }
                 break;
         }
         
-        return price;
+        return null;
     } catch (error) {
         console.error(`Error getting price from ${exchange} for ${symbol}:`, error);
         return null;
     }
 }
 
-// Fetch exchange data
+// Fetch exchange data - Update to use real exchange data
 async function fetchExchangeData() {
-    // Simulated exchange data (in a real app, you'd fetch from exchange APIs)
-    state.exchangeData = [
-        {
-            id: 'binance',
-            name: 'Binance',
-            trust_score: 10,
-            volume_24h_usd: 15000000000,
-            pairs: 1500,
-            liquidity: 'Very High
+    try {
+        // Get exchange data from Binance
+        const binanceResponse = await fetch(`${API_ENDPOINTS.BINANCE}/exchangeInfo`);
+        const binanceData = await binanceResponse.json();
+        
+        // Get OKX exchange data
+        const okxResponse = await fetch(`${API_ENDPOINTS.OKX}/market/tickers?instType=SPOT`);
+        const okxData = await okxResponse.json();
+        
+        // Get XT exchange data
+        const xtResponse = await fetch(`${API_ENDPOINTS.XT}/trade/api/v1/getTickers`);
+        const xtData = await xtResponse.json();
+        
+        // Process into our format
+        state.exchangeData = [
+            {
+                id: 'binance',
+                name: 'Binance',
+                trust_score: 10,
+                volume_24h_usd: calculateExchangeVolume(binanceData),
+                pairs: binanceData.symbols.length,
+                liquidity: 'Very High'
+            },
+            {
+                id: 'okx',
+                name: 'OKX',
+                trust_score: 9,
+                volume_24h_usd: calculateOKXVolume(okxData),
+                pairs: okxData.data ? okxData.data.length : 0,
+                liquidity: 'High'
+            },
+            {
+                id: 'xt',
+                name: 'XT.com',
+                trust_score: 8,
+                volume_24h_usd: calculateXTVolume(xtData),
+                pairs: xtData.result ? xtData.result.length : 0,
+                liquidity: 'Medium'
+            }
+        ];
+    } catch (error) {
+        console.error('Error fetching exchange data:', error);
+        throw error;
+    }
+}
+
+// Helper function to calculate Binance volume
+function calculateExchangeVolume(data) {
+    // Implement calculation based on Binance data
+    return 15000000000; // Placeholder
+}
+
+// Helper function to calculate OKX volume
+function calculateOKXVolume(data) {
+    // Implement calculation based on OKX data
+    return 5000000000; // Placeholder
+}
+
+// Helper function to calculate XT volume
+function calculateXTVolume(data) {
+    // Implement calculation based on XT data
+    return 2000000000; // Placeholder
+}
+
+// Fetch gainers and losers data - Update to use exchange data
+async function fetchGainersLosersData() {
+    try {
+        // Get data from Binance
+        const response = await fetch(`${API_ENDPOINTS.BINANCE}/ticker/24hr`);
+        const data = await response.json();
+        
+        // Filter for USDT pairs
+        const usdtPairs = data.filter(t => t.symbol.endsWith('USDT'));
+        
+        // Sort by price change
+        const sorted = usdtPairs.sort((a, b) => 
+            parseFloat(b.priceChangePercent) - parseFloat(a.priceChangePercent));
+        
+        // Get top 10 gainers and losers
+        const gainers = sorted.slice(0, 10).map(t => ({
+            symbol: t.symbol.replace('USDT', ''),
+            price: parseFloat(t.lastPrice),
+            change: parseFloat(t.priceChangePercent),
+            volume: parseFloat(t.quoteVolume)
+        }));
+        
+        const losers = sorted.slice(-10).reverse().map(t => ({
+            symbol: t.symbol.replace('USDT', ''),
+            price: parseFloat(t.lastPrice),
+            change: parseFloat(t.priceChangePercent),
+            volume: parseFloat(t.quoteVolume)
+        }));
+        
+        state.gainersData = gainers;
+        state.losersData = losers;
+    } catch (error) {
+        console.error('Error fetching gainers/losers data:', error);
+        throw error;
+    }
+}
+
+// Fetch trending data - Update to use exchange data
+async function fetchTrendingData() {
+    try {
+        // For trending data, we'll use trading volume as a proxy
+        const response = await fetch(`${API_ENDPOINTS.BINANCE}/ticker/24hr`);
+        const data = await response.json();
+        
+        // Filter for USDT pairs
+        const usdtPairs = data.filter(t => t.symbol.endsWith('USDT'));
+        
+        // Most searched - we'll use highest volume as a proxy
+        const mostSearched = usdtPairs
+            .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
+            .slice(0, 5)
+            .map(t => ({
+                symbol: t.symbol.replace('USDT', ''),
+                volume: parseFloat(t.quoteVolume)
+            }));
+        
+        // Highest volume - same as most searched in this simple implementation
+        const highestVolume = [...mostSearched];
+        
+        // New listings - we can't easily get this, so we'll return empty
+        const newListings = [];
+        
+        state.trendingData = {
+            mostSearched,
+            highestVolume,
+            newListings
+        };
+    } catch (error) {
+        console.error('Error fetching trending data:', error);
+        throw error;
+    }
+}
